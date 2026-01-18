@@ -1,0 +1,286 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local LocalPlayer = Players.LocalPlayer
+
+-- Configuration
+local TRIGGER_RADIUS = 25
+local PREDICTION_TIME = 0.5
+local UPDATE_INTERVAL = 0.1
+local REQUIRED_HISTORY = 3
+
+-- Visualization settings
+local CIRCLE_COLOR = Color3.fromRGB(0, 255, 0)
+local CIRCLE_TRANSPARENCY = 0.7
+local CIRCLE_HEIGHT_ABOVE_GROUND = 0.01
+
+-- Global variables
+local Character = nil
+local HumanoidRootPart = nil
+local PlaceWebRemote = nil
+local PlayerData = {}
+local LastUpdate = tick()
+local CirclePart = nil
+local CircleContainer = nil
+
+-- Function to initialize character
+function initializeCharacter()
+    Character = LocalPlayer.Character
+    if Character then
+        HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
+        PlaceWebRemote = Character:WaitForChild("Spider Web"):WaitForChild("PlaceWeb")
+        setupCircle()
+        return true
+    end
+    return false
+end
+
+-- Function to create or update the circle visualization
+function setupCircle()
+    -- Remove old circle if exists
+    if CircleContainer then
+        CircleContainer:Destroy()
+    end
+    
+    -- Create container for circle
+    CircleContainer = Instance.new("Part")
+    CircleContainer.Name = "RadiusVisualization"
+    CircleContainer.Anchored = true
+    CircleContainer.CanCollide = false
+    CircleContainer.CanQuery = false
+    CircleContainer.CanTouch = false
+    CircleContainer.Transparency = 1
+    CircleContainer.Size = Vector3.new(0.1, 0.1, 0.1)
+    
+    -- Create the actual circle (flat cylinder)
+    CirclePart = Instance.new("Part")
+    CirclePart.Name = "RadiusCircle"
+    CirclePart.Shape = Enum.PartType.Cylinder
+    CirclePart.Anchored = true
+    CirclePart.CanCollide = false
+    CirclePart.CanQuery = false
+    CirclePart.CanTouch = false
+    CirclePart.Transparency = CIRCLE_TRANSPARENCY
+    CirclePart.Material = Enum.Material.Neon
+    CirclePart.Color = CIRCLE_COLOR
+    
+    -- Size for 25 stud radius
+    CirclePart.Size = Vector3.new(0.1, TRIGGER_RADIUS * 2, TRIGGER_RADIUS * 2)
+    
+    -- Position and rotate to be flat on ground
+    CirclePart.Parent = CircleContainer
+    CircleContainer.Parent = workspace
+end
+
+-- Function to update circle position
+function updateCirclePosition()
+    if not Character or not HumanoidRootPart or not CircleContainer then
+        return
+    end
+    
+    -- Get current position
+    local position = HumanoidRootPart.Position
+    
+    -- Raycast to find ground position
+    local rayOrigin = position + Vector3.new(0, 5, 0)
+    local rayDirection = Vector3.new(0, -20, 0)
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
+    raycastParams.FilterDescendantsInstances = {Character, CircleContainer}
+    
+    local raycastResult = workspace:Raycast(rayOrigin, rayDirection, raycastParams)
+    
+    if raycastResult then
+        -- Place circle on the ground surface
+        local groundPosition = raycastResult.Position
+        CircleContainer.CFrame = CFrame.new(groundPosition + Vector3.new(0, CIRCLE_HEIGHT_ABOVE_GROUND, 0))
+        CirclePart.CFrame = CircleContainer.CFrame * CFrame.Angles(0, 0, math.rad(90))
+    else
+        -- If no ground found, place at character's feet
+        local feetPosition = Vector3.new(position.X, position.Y - 3, position.Z)
+        CircleContainer.CFrame = CFrame.new(feetPosition + Vector3.new(0, CIRCLE_HEIGHT_ABOVE_GROUND, 0))
+        CirclePart.CFrame = CircleContainer.CFrame * CFrame.Angles(0, 0, math.rad(90))
+    end
+end
+
+-- Function to predict position
+function predictPosition(targetPlayer, targetHRP)
+    local data = PlayerData[targetPlayer]
+    
+    -- Need at least 2 data points to calculate velocity
+    if not data or #data.positions < 2 then
+        return targetHRP.Position
+    end
+    
+    -- Calculate average velocity from recent positions
+    local positions = data.positions
+    local velocities = {}
+    
+    for i = 2, #positions do
+        local timeDiff = data.timestamps[i] - data.timestamps[i-1]
+        if timeDiff > 0 then
+            local vel = (positions[i] - positions[i-1]) / timeDiff
+            table.insert(velocities, vel)
+        end
+    end
+    
+    if #velocities == 0 then
+        return targetHRP.Position
+    end
+    
+    -- Use average of recent velocities
+    local avgVelocity = Vector3.new(0, 0, 0)
+    for _, vel in ipairs(velocities) do
+        avgVelocity = avgVelocity + vel
+    end
+    avgVelocity = avgVelocity / #velocities
+    
+    -- Predict future position
+    local prediction = targetHRP.Position + (avgVelocity * PREDICTION_TIME)
+    
+    return prediction
+end
+
+-- Function to place web manually if needed
+function placeWebAtPredictedPosition(targetPlayer)
+    if targetPlayer and targetPlayer.Character then
+        local targetHRP = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if targetHRP and PlaceWebRemote then
+            local data = PlayerData[targetPlayer]
+            if data and #data.positions >= REQUIRED_HISTORY then
+                local predictedPosition = predictPosition(targetPlayer, targetHRP)
+                local args = {predictedPosition}
+                PlaceWebRemote:FireServer(unpack(args))
+                return predictedPosition
+            end
+        end
+    end
+    return nil
+end
+
+-- Character respawn handler
+LocalPlayer.CharacterAdded:Connect(function(newCharacter)
+    wait(0.5)
+    initializeCharacter()
+end)
+
+-- Death handler
+LocalPlayer.CharacterRemoving:Connect(function()
+    Character = nil
+    HumanoidRootPart = nil
+    PlaceWebRemote = nil
+    
+    -- Hide circle when dead
+    if CircleContainer then
+        CircleContainer.Parent = nil
+    end
+end)
+
+-- Main update loop for circle position
+RunService.Heartbeat:Connect(function()
+    updateCirclePosition()
+end)
+
+-- Main loop to track players and place webs
+RunService.Heartbeat:Connect(function()
+    local currentTime = tick()
+    
+    -- Update less frequently for performance
+    if currentTime - LastUpdate < UPDATE_INTERVAL or not PlaceWebRemote then
+        return
+    end
+    LastUpdate = currentTime
+    
+    -- Initialize data for all players
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            if not PlayerData[player] then
+                PlayerData[player] = {
+                    positions = {},
+                    timestamps = {}
+                }
+            end
+        end
+    end
+    
+    -- Update player positions and check for web placement
+    for player, data in pairs(PlayerData) do
+        if player ~= LocalPlayer and player.Character and Character and HumanoidRootPart then
+            local targetHRP = player.Character:FindFirstChild("HumanoidRootPart")
+            if targetHRP then
+                -- Store position history
+                table.insert(data.positions, targetHRP.Position)
+                table.insert(data.timestamps, currentTime)
+                
+                -- Keep only recent history
+                if #data.positions > 10 then
+                    table.remove(data.positions, 1)
+                    table.remove(data.timestamps, 1)
+                end
+                
+                -- Check distance
+                local distance = (targetHRP.Position - HumanoidRootPart.Position).Magnitude
+                
+                if distance <= TRIGGER_RADIUS and #data.positions >= REQUIRED_HISTORY then
+                    -- Calculate predicted position
+                    local predictedPosition = predictPosition(player, targetHRP)
+                    
+                    -- Place web at predicted position
+                    local args = {predictedPosition}
+                    PlaceWebRemote:FireServer(unpack(args))
+                    
+                    -- Clear some history after placing
+                    for i = 1, 5 do
+                        if #data.positions > 0 then
+                            table.remove(data.positions, 1)
+                            table.remove(data.timestamps, 1)
+                        end
+                    end
+                    
+                    break
+                end
+            end
+        end
+    end
+    
+    -- Clean up data for players who left
+    for player in pairs(PlayerData) do
+        if not Players:FindFirstChild(player.Name) then
+            PlayerData[player] = nil
+        end
+    end
+end)
+
+-- Optional: Add a keybind to manually trigger prediction
+local UserInputService = game:GetService("UserInputService")
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if not gameProcessed and input.KeyCode == Enum.KeyCode.Q then
+        if not PlaceWebRemote then return end
+        
+        -- Find closest player
+        local closestPlayer = nil
+        local closestDistance = math.huge
+        
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and player.Character and Character and HumanoidRootPart then
+                local targetHRP = player.Character:FindFirstChild("HumanoidRootPart")
+                if targetHRP then
+                    local distance = (targetHRP.Position - HumanoidRootPart.Position).Magnitude
+                    if distance < closestDistance and distance <= TRIGGER_RADIUS then
+                        closestDistance = distance
+                        closestPlayer = player
+                    end
+                end
+            end
+        end
+        
+        if closestPlayer then
+            placeWebAtPredictedPosition(closestPlayer)
+        end
+    end
+end)
+
+-- Initial setup
+wait(1)
+initializeCharacter()
+print("Auto web predictor loaded! 25-stud radius with circle visualization. Press Q for manual prediction.")
