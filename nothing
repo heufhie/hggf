@@ -1,0 +1,378 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local LocalPlayer = Players.LocalPlayer
+
+-- Configuration
+local PREDICTION_TIME = 0.5 -- How far ahead to predict (0.5 seconds)
+local UPDATE_INTERVAL = 0.1 -- How often to update predictions
+local REQUIRED_HISTORY = 3 -- Minimum position samples needed for prediction
+local AUTO_SHOOT_ENABLED = true -- Toggle auto-shooting
+local SHOT_COOLDOWN = 0.5 -- Minimum time between shots
+
+-- Global variables
+local Character = nil
+local HumanoidRootPart = nil
+local ShootEvent = nil
+local PlayerData = {}
+local LastUpdate = tick()
+local LastShot = 0
+
+-- Function to initialize character
+function initializeCharacter()
+    Character = LocalPlayer.Character
+    if Character then
+        HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
+        ShootEvent = Character:WaitForChild("Bow"):WaitForChild("ShootEvent")
+        return true
+    end
+    return false
+end
+
+-- Function to calculate angle for shooting (improved)
+function calculateShootAngle(startPos, targetPos)
+    -- Get horizontal distance
+    local horizontalDistance = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(startPos.X, 0, startPos.Z)).Magnitude
+    local heightDifference = targetPos.Y - startPos.Y
+    
+    -- If horizontal distance is very small, use default angle
+    if horizontalDistance < 1 then
+        return 0.08856413333948392
+    end
+    
+    -- Calculate angle based on physics (projectile motion)
+    -- Adjust this formula based on your game's arrow speed/gravity
+    local angle = math.atan(heightDifference / horizontalDistance)
+    
+    -- Add a small correction factor for distance (adjust as needed)
+    if horizontalDistance > 50 then
+        angle = angle + 0.05 -- Slightly higher angle for long distance
+    end
+    
+    return angle
+end
+
+-- Function to predict position with velocity
+function predictPosition(targetPlayer, targetHRP)
+    local data = PlayerData[targetPlayer]
+    
+    if not data or #data.positions < 2 then
+        return targetHRP.Position, 0.08856413333948392
+    end
+    
+    -- Calculate average velocity
+    local positions = data.positions
+    local velocities = {}
+    
+    for i = 2, #positions do
+        local timeDiff = data.timestamps[i] - data.timestamps[i-1]
+        if timeDiff > 0 then
+            local vel = (positions[i] - positions[i-1]) / timeDiff
+            table.insert(velocities, vel)
+        end
+    end
+    
+    if #velocities == 0 then
+        return targetHRP.Position, 0.08856413333948392
+    end
+    
+    -- Calculate average velocity
+    local avgVelocity = Vector3.new(0, 0, 0)
+    for _, vel in ipairs(velocities) do
+        avgVelocity = avgVelocity + vel
+    end
+    avgVelocity = avgVelocity / #velocities
+    
+    -- Predict future position
+    local prediction = targetHRP.Position + (avgVelocity * PREDICTION_TIME)
+    
+    return prediction
+end
+
+-- Function to shoot at position
+function shootAtPosition(targetPos)
+    if not ShootEvent or not Character or not HumanoidRootPart then
+        return false
+    end
+    
+    local currentTime = tick()
+    if currentTime - LastShot < SHOT_COOLDOWN then
+        return false
+    end
+    
+    -- Calculate shooting angle
+    local startPos = HumanoidRootPart.Position + Vector3.new(0, 2, 0) -- Shoot from chest height
+    local angle = calculateShootAngle(startPos, targetPos)
+    
+    -- Fire the shoot event
+    local args = {
+        targetPos,
+        angle
+    }
+    
+    ShootEvent:FireServer(unpack(args))
+    LastShot = currentTime
+    
+    return true
+end
+
+-- Function to find and shoot at closest player
+function shootAtClosestPlayer()
+    if not ShootEvent or not Character or not HumanoidRootPart then
+        return false
+    end
+    
+    local currentTime = tick()
+    if currentTime - LastShot < SHOT_COOLDOWN then
+        return false
+    end
+    
+    -- Find closest player (no range limit)
+    local closestPlayer = nil
+    local closestDistance = math.huge
+    local closestHRP = nil
+    
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local targetHRP = player.Character:FindFirstChild("HumanoidRootPart")
+            if targetHRP then
+                local distance = (targetHRP.Position - HumanoidRootPart.Position).Magnitude
+                if distance < closestDistance then
+                    closestDistance = distance
+                    closestPlayer = player
+                    closestHRP = targetHRP
+                end
+            end
+        end
+    end
+    
+    if closestPlayer and closestHRP then
+        local predictedPos = predictPosition(closestPlayer, closestHRP)
+        return shootAtPosition(predictedPos)
+    end
+    
+    return false
+end
+
+-- Character respawn handler
+LocalPlayer.CharacterAdded:Connect(function(newCharacter)
+    wait(0.5)
+    initializeCharacter()
+end)
+
+-- Death handler
+LocalPlayer.CharacterRemoving:Connect(function()
+    Character = nil
+    HumanoidRootPart = nil
+    ShootEvent = nil
+end)
+
+-- Main loop to track players and auto-shoot
+RunService.Heartbeat:Connect(function()
+    local currentTime = tick()
+    
+    -- Update less frequently for performance
+    if currentTime - LastUpdate < UPDATE_INTERVAL or not ShootEvent or not AUTO_SHOOT_ENABLED then
+        return
+    end
+    LastUpdate = currentTime
+    
+    -- Check cooldown
+    if currentTime - LastShot < SHOT_COOLDOWN then
+        return
+    end
+    
+    -- Initialize data for all players
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            if not PlayerData[player] then
+                PlayerData[player] = {
+                    positions = {},
+                    timestamps = {}
+                }
+            end
+        end
+    end
+    
+    -- Find closest player with enough history
+    local closestPlayer = nil
+    local closestDistance = math.huge
+    local closestHRP = nil
+    
+    for player, data in pairs(PlayerData) do
+        if player ~= LocalPlayer and player.Character and Character and HumanoidRootPart then
+            local targetHRP = player.Character:FindFirstChild("HumanoidRootPart")
+            if targetHRP then
+                -- Store position history
+                table.insert(data.positions, targetHRP.Position)
+                table.insert(data.timestamps, currentTime)
+                
+                -- Keep only recent history
+                if #data.positions > 10 then
+                    table.remove(data.positions, 1)
+                    table.remove(data.timestamps, 1)
+                end
+                
+                -- Check if this is the closest player with enough history
+                local distance = (targetHRP.Position - HumanoidRootPart.Position).Magnitude
+                if distance < closestDistance and #data.positions >= REQUIRED_HISTORY then
+                    closestDistance = distance
+                    closestPlayer = player
+                    closestHRP = targetHRP
+                end
+            end
+        end
+    end
+    
+    -- Shoot at closest player
+    if closestPlayer and closestHRP then
+        local predictedPos = predictPosition(closestPlayer, closestHRP)
+        shootAtPosition(predictedPos)
+    end
+    
+    -- Clean up data for players who left
+    for player in pairs(PlayerData) do
+        if not Players:FindFirstChild(player.Name) then
+            PlayerData[player] = nil
+        end
+    end
+end)
+
+-- Keybinds for manual control
+local UserInputService = game:GetService("UserInputService")
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    
+    -- Toggle auto-shoot with T key
+    if input.KeyCode == Enum.KeyCode.T then
+        AUTO_SHOOT_ENABLED = not AUTO_SHOOT_ENABLED
+        print("Auto-shoot: " .. (AUTO_SHOOT_ENABLED and "ENABLED" or "DISABLED"))
+    end
+    
+    -- Manual shoot at closest player with Q key
+    if input.KeyCode == Enum.KeyCode.Q then
+        shootAtClosestPlayer()
+    end
+    
+    -- Manual aim and shoot at mouse position with E key
+    if input.KeyCode == Enum.KeyCode.E then
+        local mouse = LocalPlayer:GetMouse()
+        if mouse.Target and mouse.Hit then
+            shootAtPosition(mouse.Hit.Position)
+        end
+    end
+    
+    -- Force shoot at specific location with F key (for testing)
+    if input.KeyCode == Enum.KeyCode.F and HumanoidRootPart then
+        local forwardPos = HumanoidRootPart.Position + (HumanoidRootPart.CFrame.LookVector * 50)
+        shootAtPosition(forwardPos)
+    end
+end)
+
+-- Visual indicator for auto-shoot status
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "BowAutoShootUI"
+ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local StatusText = Instance.new("TextLabel")
+StatusText.Name = "StatusText"
+StatusText.Size = UDim2.new(0, 250, 0, 60)
+StatusText.Position = UDim2.new(0.02, 0, 0.02, 0)
+StatusText.BackgroundTransparency = 0.5
+StatusText.BackgroundColor3 = Color3.new(0, 0, 0)
+StatusText.TextColor3 = Color3.new(1, 1, 1)
+StatusText.Text = "Bow Auto: ON\nTarget: CLOSEST PLAYER\nCooldown: Ready"
+StatusText.Font = Enum.Font.SourceSansBold
+StatusText.TextSize = 16
+StatusText.TextXAlignment = Enum.TextXAlignment.Left
+StatusText.TextYAlignment = Enum.TextYAlignment.Top
+StatusText.Parent = ScreenGui
+
+-- Target tracking display
+local TargetInfo = Instance.new("TextLabel")
+TargetInfo.Name = "TargetInfo"
+TargetInfo.Size = UDim2.new(0, 250, 0, 80)
+TargetInfo.Position = UDim2.new(0.02, 0, 0.12, 0)
+TargetInfo.BackgroundTransparency = 0.7
+TargetInfo.BackgroundColor3 = Color3.new(0, 0, 0)
+TargetInfo.TextColor3 = Color3.new(1, 1, 1)
+TargetInfo.Text = "No target"
+TargetInfo.Font = Enum.Font.SourceSans
+TargetInfo.TextSize = 14
+TargetInfo.TextXAlignment = Enum.TextXAlignment.Left
+TargetInfo.TextYAlignment = Enum.TextYAlignment.Top
+TargetInfo.Parent = ScreenGui
+
+-- Update UI
+RunService.Heartbeat:Connect(function()
+    -- Update status
+    if AUTO_SHOOT_ENABLED then
+        StatusText.Text = "Bow Auto: ON\nTarget: CLOSEST PLAYER"
+        StatusText.TextColor3 = Color3.fromRGB(0, 255, 0)
+    else
+        StatusText.Text = "Bow Auto: OFF\nTarget: CLOSEST PLAYER"
+        StatusText.TextColor3 = Color3.fromRGB(255, 100, 100)
+    end
+    
+    -- Update cooldown
+    local currentTime = tick()
+    local remaining = SHOT_COOLDOWN - (currentTime - LastShot)
+    if remaining > 0 then
+        StatusText.Text = StatusText.Text .. string.format("\nCooldown: %.1fs", remaining)
+    else
+        StatusText.Text = StatusText.Text .. "\nCooldown: Ready"
+    end
+    
+    -- Update target info
+    if Character and HumanoidRootPart then
+        local closestPlayer = nil
+        local closestDistance = math.huge
+        local closestHRP = nil
+        
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and player.Character then
+                local targetHRP = player.Character:FindFirstChild("HumanoidRootPart")
+                if targetHRP then
+                    local distance = (targetHRP.Position - HumanoidRootPart.Position).Magnitude
+                    if distance < closestDistance then
+                        closestDistance = distance
+                        closestPlayer = player
+                        closestHRP = targetHRP
+                    end
+                end
+            end
+        end
+        
+        if closestPlayer and closestHRP then
+            local data = PlayerData[closestPlayer]
+            local historyCount = data and #data.positions or 0
+            
+            TargetInfo.Text = string.format("Target: %s\nDistance: %.1f studs\nHistory: %d samples\nPrediction: %.1f sec",
+                closestPlayer.Name,
+                closestDistance,
+                historyCount,
+                PREDICTION_TIME)
+        else
+            TargetInfo.Text = "No players found"
+        end
+    else
+        TargetInfo.Text = "Character not loaded"
+    end
+end)
+
+-- Initial setup
+wait(1)
+initializeCharacter()
+print("==================== BOW AUTO-SHOOTER ====================")
+print("Features:")
+print("- Attacks CLOSEST PLAYER (no range limit)")
+print("- 0.5s movement prediction")
+print("- Smart angle calculation")
+print("- 0.5s shot cooldown")
+print("")
+print("Controls:")
+print("T - Toggle auto-shoot ON/OFF")
+print("Q - Manual shoot at closest player")
+print("E - Shoot at mouse position")
+print("F - Test shot forward")
+print("=======================================================")
